@@ -1,369 +1,187 @@
-// COMMENTED OUT - COMPLEX MULTIPLAYER SYSTEM
-// TODO: Rewrite with simpler approach for two-player connection
 
-/*
 import { connectRealtime } from '@devvit/web/client';
-import { GameState, Player, PlayerUpdate, TrailUpdate, TerritoryClaim, PlayerElimination } from '../../shared/types/api';
 
+// REALTIME MULTIPLAYER MANAGER FOR TWO-PLAYER CONNECTION
 export class MultiplayerManager {
   private realtimeConnection: any = null;
   private gameId: string = '';
   private playerId: string = '';
-  private roomId: string = '';
-  private gameState: GameState | null = null;
-  private otherPlayers: Map<string, Player> = new Map();
-  private lastUpdateTime: number = 0;
-  private updateRate: number = 1000 / 20; // 20 FPS
-  private pollingInterval: number | null = null;
+  private gameState: any = null;
+  private otherPlayers: Map<string, any> = new Map();
+  private lastPositionUpdate: number = 0;
+  private positionUpdateRate: number = 100; // Update position every 100ms (for Redis storage)
+  private territoryClaimListeners: Array<(payload: any) => void> = [];
 
   constructor() {
+    console.log('Realtime MultiplayerManager initialized');
+    // Connect to realtime on initialization
     this.connectToRealtime();
   }
 
   private async connectToRealtime() {
+    // Don't connect multiple times
+    if (this.realtimeConnection) {
+      console.log('⚠️ Realtime connection already exists, skipping...');
+      return;
+    }
+    
     try {
+      console.log('🔌 Connecting to realtime channel: game');
       this.realtimeConnection = await connectRealtime({
         channel: 'game',
         onMessage: (message: any) => {
           this.handleRealtimeMessage(message);
         },
         onConnect: (channel: string) => {
-          console.log(`Connected to realtime channel: ${channel}`);
+          console.log(`✅ Connected to realtime channel: ${channel}`);
         },
         onDisconnect: (channel: string) => {
-          console.log(`Disconnected from realtime channel: ${channel}`);
+          console.log(`❌ Disconnected from realtime channel: ${channel}`);
+          // Clear the connection reference
+          this.realtimeConnection = null;
           // Attempt to reconnect after a delay
           setTimeout(() => {
-            this.connectToRealtime();
-          }, 5000);
+            if (this.gameId && this.playerId) {
+              console.log('🔄 Reconnecting after disconnect...');
+              this.connectToRealtime();
+            }
+          }, 2000);
         }
       });
-      console.log('Connected to realtime service');
+      console.log('✅ Realtime connection established');
     } catch (error) {
-      console.error('Failed to connect to realtime:', error);
-      // Retry connection after a delay
-      setTimeout(() => {
-        this.connectToRealtime();
-      }, 10000);
-    }
-  }
-
-  async createGame(): Promise<{ roomId: string; gameId: string }> {
-    try {
-      const response = await fetch('/api/game/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to create game');
+      console.error('❌ Failed to connect to realtime:', error);
+      this.realtimeConnection = null;
+      // Retry connection after a delay if we're in a game
+      if (this.gameId && this.playerId) {
+        setTimeout(() => {
+          this.connectToRealtime();
+        }, 5000);
       }
-
-      const data = await response.json();
-      this.gameId = data.gameId;
-      
-      return { roomId: data.roomId, gameId: data.gameId };
-    } catch (error) {
-      console.error('Failed to create game:', error);
-      throw error;
     }
   }
+
+
   private handleRealtimeMessage(message: any) {
-    console.log('Received realtime message:', message);
-    
     // Handle different message types
     if (message.type === 'gameStateUpdate') {
+      console.log('🔄 Handling gameStateUpdate, current playerId:', this.playerId);
       this.handleGameStateUpdate(message.gameState);
     } else if (message.type === 'playerUpdate') {
-      console.log(`Handling player update for: ${message.playerUpdate.playerId}`);
       this.handlePlayerUpdate(message.playerUpdate);
     } else if (message.type === 'trailUpdate') {
-      console.log(`Handling trail update for: ${message.trailUpdate.playerId}`);
       this.handleTrailUpdate(message.trailUpdate);
     } else if (message.type === 'territoryClaim') {
-      console.log(`Handling territory claim for: ${message.territoryClaim.playerId}`);
       this.handleTerritoryClaim(message.territoryClaim);
-    } else if (message.type === 'playerElimination') {
-      this.handlePlayerElimination(message.playerElimination);
+    } else if (message.type === 'playerRemoved') {
+      this.handlePlayerRemoved(message.playerId);
     }
   }
 
-  async joinGame(roomId: string, username: string, subreddit: string): Promise<{ playerId: string; gameState: GameState }> {
-    try {
-      const response = await fetch('/api/game/join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId, username, subreddit })
+  private handlePlayerRemoved(playerId: string) {
+    console.log(`🗑️ Player ${playerId} was removed from game`);
+    // Remove player from other players map
+    this.otherPlayers.delete(playerId);
+    // Update game state to reflect removal
+    if (this.gameState && this.gameState.players) {
+      delete this.gameState.players[playerId];
+    }
+  }
+
+  private handleGameStateUpdate(gameState: any) {
+    // Verify this is for our game
+    if (!gameState || (this.gameId && gameState.gameId !== this.gameId)) {
+      console.log('⚠️ Ignoring gameStateUpdate - wrong game:', {
+        receivedGameId: gameState?.gameId,
+        myGameId: this.gameId
       });
-
-      if (!response.ok) {
-        throw new Error('Failed to join game');
-      }
-
-      const data = await response.json();
-      this.playerId = data.playerId;
-      this.gameState = data.gameState;
-      this.gameId = data.gameState.gameId;
-      this.roomId = roomId;
-      
-      // Start polling fallback if realtime is not working
-      this.startPollingFallback();
-      
-      return { playerId: data.playerId, gameState: data.gameState };
-    } catch (error) {
-      console.error('Failed to join game:', error);
-      throw error;
-    }
-  }
-
-  async quickJoin(username: string, subreddit: string): Promise<{ playerId: string; gameState: GameState; roomId: string }> {
-    try {
-      const response = await fetch('/api/game/quick-join', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, subreddit })
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to quick join game');
-      }
-
-      const data = await response.json();
-      this.playerId = data.playerId;
-      this.gameState = data.gameState;
-      this.gameId = data.gameState.gameId;
-      this.roomId = data.roomId;
-      
-      // Start polling fallback if realtime is not working
-      this.startPollingFallback();
-      
-      return { playerId: data.playerId, gameState: data.gameState, roomId: data.roomId };
-    } catch (error) {
-      console.error('Failed to quick join game:', error);
-      throw error;
-    }
-  }
-
-  private handleGameStateUpdate(gameState: GameState) {
-    console.log(`Handling game state update. Players: ${gameState.players.size}, My ID: ${this.playerId}`);
-    this.gameState = gameState;
-    // Convert players Map from object
-    if (gameState.players && typeof gameState.players === 'object') {
-      gameState.players = new Map(Object.entries(gameState.players));
+      return;
     }
     
-    // Update other players
-    this.otherPlayers.clear();
-    if (gameState.players) {
-      for (const [playerId, player] of gameState.players) {
-        if (playerId !== this.playerId) {
-          this.otherPlayers.set(playerId, player);
-          console.log(`Added player to otherPlayers: ${playerId} (${player.username})`);
-        }
-      }
+    console.log('🔄 Handling gameStateUpdate:', {
+      gameId: gameState?.gameId,
+      playerCount: gameState?.players ? Object.keys(gameState.players).length : 0,
+      myPlayerId: this.playerId,
+      playerIds: gameState?.players ? Object.keys(gameState.players) : []
+    });
+    
+    // Update game ID if not set yet (shouldn't happen, but just in case)
+    if (!this.gameId && gameState.gameId) {
+      this.gameId = gameState.gameId;
     }
-    console.log(`Total other players: ${this.otherPlayers.size}`);
+    
+    // Update full game state and initialize other players
+    this.gameState = gameState;
+    this.initializeOtherPlayers(gameState);
   }
 
-  private handlePlayerUpdate(playerUpdate: PlayerUpdate) {
+  private handlePlayerUpdate(playerUpdate: any) {
     if (playerUpdate.playerId === this.playerId) return;
     
+    // This is a direction change update from realtime - use it as the base for prediction
     let player = this.otherPlayers.get(playerUpdate.playerId);
     if (player) {
-      // Update existing player
+      // Update with new direction and position (this is the authoritative source for prediction)
       player.position = playerUpdate.position;
       player.direction = playerUpdate.direction;
       player.isInOwnTerritory = playerUpdate.isInOwnTerritory;
       player.lastUpdate = playerUpdate.timestamp;
     } else {
-      // Create new player if they don't exist
-      // We need to get the full player data from the game state
-      if (this.gameState && this.gameState.players.has(playerUpdate.playerId)) {
-        const fullPlayer = this.gameState.players.get(playerUpdate.playerId)!;
-        this.otherPlayers.set(playerUpdate.playerId, fullPlayer);
-        console.log(`Added new player to otherPlayers: ${playerUpdate.playerId}`);
+      // Create new player entry if they don't exist
+      if (this.gameState && this.gameState.players && this.gameState.players[playerUpdate.playerId]) {
+        player = this.gameState.players[playerUpdate.playerId];
+        // Update with latest position and direction
+        player.position = playerUpdate.position;
+        player.direction = playerUpdate.direction;
+        player.isInOwnTerritory = playerUpdate.isInOwnTerritory;
+        player.lastUpdate = playerUpdate.timestamp;
+        this.otherPlayers.set(playerUpdate.playerId, player);
       }
+      // If player doesn't exist in gameState, they'll be added on gameStateUpdate
     }
   }
 
-  private handleTrailUpdate(trailUpdate: TrailUpdate) {
+  private handleTrailUpdate(trailUpdate: any) {
     if (trailUpdate.playerId === this.playerId) return;
     
     let player = this.otherPlayers.get(trailUpdate.playerId);
     if (player) {
-      // Update existing player
       player.trailPoints = trailUpdate.trailPoints;
       player.lastUpdate = trailUpdate.timestamp;
     } else {
-      // Create new player if they don't exist
-      if (this.gameState && this.gameState.players.has(trailUpdate.playerId)) {
-        const fullPlayer = this.gameState.players.get(trailUpdate.playerId)!;
-        this.otherPlayers.set(trailUpdate.playerId, fullPlayer);
-        console.log(`Added new player to otherPlayers from trail update: ${trailUpdate.playerId}`);
+      // Create player entry if they don't exist (get from game state)
+      if (this.gameState && this.gameState.players && this.gameState.players[trailUpdate.playerId]) {
+        player = this.gameState.players[trailUpdate.playerId];
+        player.trailPoints = trailUpdate.trailPoints;
+        player.lastUpdate = trailUpdate.timestamp;
+        this.otherPlayers.set(trailUpdate.playerId, player);
       }
     }
   }
 
-  private handleTerritoryClaim(territoryClaim: TerritoryClaim) {
+  private handleTerritoryClaim(territoryClaim: any) {
     if (territoryClaim.playerId === this.playerId) return;
     
     let player = this.otherPlayers.get(territoryClaim.playerId);
     if (player) {
-      // Update existing player
       player.occupiedAreas.push(territoryClaim.occupiedArea);
       player.trailPoints = []; // Clear trail after claiming
       player.lastUpdate = territoryClaim.timestamp;
     } else {
-      // Create new player if they don't exist
-      if (this.gameState && this.gameState.players.has(territoryClaim.playerId)) {
-        const fullPlayer = this.gameState.players.get(territoryClaim.playerId)!;
-        this.otherPlayers.set(territoryClaim.playerId, fullPlayer);
-        console.log(`Added new player to otherPlayers from territory claim: ${territoryClaim.playerId}`);
+      // Create player entry if they don't exist (get from game state)
+      if (this.gameState && this.gameState.players && this.gameState.players[territoryClaim.playerId]) {
+        player = this.gameState.players[territoryClaim.playerId];
+        player.occupiedAreas.push(territoryClaim.occupiedArea);
+        player.trailPoints = [];
+        player.lastUpdate = territoryClaim.timestamp;
+        this.otherPlayers.set(territoryClaim.playerId, player);
       }
     }
-  }
 
-  private handlePlayerElimination(playerElimination: PlayerElimination) {
-    const player = this.otherPlayers.get(playerElimination.playerId);
-    if (player) {
-      player.isAlive = false;
-    }
-  }
-
-  async updatePlayerPosition(position: { x: number; y: number }, direction: number, isInOwnTerritory: boolean) {
-    const now = Date.now();
-    if (now - this.lastUpdateTime < this.updateRate) return;
-    
-    this.lastUpdateTime = now;
-
-    try {
-      await fetch('/api/game/update-player', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gameId: this.gameId,
-          playerId: this.playerId,
-          position,
-          direction,
-          isInOwnTerritory
-        })
-      });
-    } catch (error) {
-      console.error('Failed to update player position:', error);
-    }
-  }
-
-  async updateTrail(trailPoints: Array<{x: number, y: number}>) {
-    try {
-      await fetch('/api/game/update-trail', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gameId: this.gameId,
-          playerId: this.playerId,
-          trailPoints
-        })
-      });
-    } catch (error) {
-      console.error('Failed to update trail:', error);
-    }
-  }
-
-  async claimTerritory(occupiedArea: {points: Array<{x: number, y: number}>, color: number}) {
-    try {
-      await fetch('/api/game/claim-territory', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gameId: this.gameId,
-          playerId: this.playerId,
-          occupiedArea
-        })
-      });
-    } catch (error) {
-      console.error('Failed to claim territory:', error);
-    }
-  }
-
-  async leaveGame() {
-    try {
-      await fetch('/api/game/leave', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          gameId: this.gameId,
-          playerId: this.playerId,
-          roomId: this.roomId
-        })
-      });
-
-      if (this.realtimeConnection) {
-        await this.realtimeConnection.disconnect();
-      }
-      
-      // Stop polling fallback
-      this.stopPollingFallback();
-    } catch (error) {
-      console.error('Failed to leave game:', error);
-    }
-  }
-
-  private startPollingFallback() {
-    // Poll for game state updates every 2 seconds as fallback
-    this.pollingInterval = window.setInterval(async () => {
-      try {
-        const response = await fetch(`/api/game/state/${this.gameId}`);
-        if (response.ok) {
-          const gameState = await response.json();
-          this.handleGameStateUpdate(gameState);
-        }
-      } catch (error) {
-        console.warn('Polling fallback failed:', error);
-      }
-    }, 2000);
-  }
-
-  private stopPollingFallback() {
-    if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
-      this.pollingInterval = null;
-    }
-  }
-
-  getOtherPlayers(): Map<string, Player> {
-    return this.otherPlayers;
-  }
-
-  getGameState(): GameState | null {
-    return this.gameState;
-  }
-
-  getPlayerId(): string {
-    return this.playerId;
-  }
-
-  getGameId(): string {
-    return this.gameId;
-  }
-
-  isConnected(): boolean {
-    return this.realtimeConnection !== null;
-  }
-}
-*/
-
-// SIMPLE MULTIPLAYER MANAGER FOR TWO-PLAYER CONNECTION
-export class MultiplayerManager {
-  private gameId: string = '';
-  private playerId: string = '';
-  private gameState: any = null;
-  private otherPlayers: Map<string, any> = new Map();
-  private pollingInterval: number | null = null;
-  private lastPositionUpdate: number = 0;
-  private positionUpdateRate: number = 100; // Update position every 100ms (10 times per second)
-
-  constructor() {
-    console.log('Simple MultiplayerManager initialized');
+    // Notify listeners so UI can update leaderboard
+    this.territoryClaimListeners.forEach((cb) => {
+      try { cb(territoryClaim); } catch {}
+    });
   }
 
   async createGame(): Promise<{ gameId: string }> {
@@ -381,8 +199,8 @@ export class MultiplayerManager {
       this.gameId = data.gameId;
       this.gameState = data.gameState;
       
-      // Start polling for game state updates
-      this.startPolling();
+      // Initialize other players from game state
+      this.initializeOtherPlayers(data.gameState);
       
       return { gameId: data.gameId };
     } catch (error) {
@@ -391,7 +209,7 @@ export class MultiplayerManager {
     }
   }
 
-  async joinGame(username: string, subreddit: string): Promise<{ playerId: string; gameState: any; gameId: string }> {
+  async joinGame(username: string, subreddit: string, initialPosition?: { x: number; y: number }, initialDirection?: number): Promise<{ playerId: string; gameState: any; gameId: string }> {
     try {
       // Ensure username is valid
       if (!username || typeof username !== 'string' || username.trim() === '') {
@@ -399,7 +217,15 @@ export class MultiplayerManager {
         console.warn('Invalid username, using default:', username);
       }
 
-      const requestBody = { username, subreddit: subreddit || 'r/gaming' };
+      const requestBody: any = { username, subreddit: subreddit || 'r/gaming' };
+      
+      // Send initial position and direction if provided (from client player state)
+      if (initialPosition && initialDirection !== undefined) {
+        requestBody.position = initialPosition;
+        requestBody.direction = initialDirection;
+        console.log('Joining game with initial position/direction:', { position: initialPosition, direction: initialDirection });
+      }
+      
       console.log('Joining game with:', requestBody);
 
       const response = await fetch('/api/game/join', {
@@ -419,8 +245,15 @@ export class MultiplayerManager {
       this.gameState = data.gameState;
       this.gameId = data.gameId;
       
-      // Start polling for game state updates
-      this.startPolling();
+      console.log('✅ Joined game:', {
+        playerId: this.playerId,
+        gameId: this.gameId,
+        gameStatePlayers: data.gameState?.players ? Object.keys(data.gameState.players) : [],
+        otherPlayersCount: data.gameState?.players ? Object.keys(data.gameState.players).length - 1 : 0
+      });
+      
+      // Initialize other players from game state
+      this.initializeOtherPlayers(data.gameState);
       
       return { playerId: data.playerId, gameState: data.gameState, gameId: data.gameId };
     } catch (error) {
@@ -434,81 +267,53 @@ export class MultiplayerManager {
     return await this.joinGame(username, subreddit);
   }
 
-  private startPolling() {
-    // Poll for game state updates every 100ms (10 times per second) for smooth multiplayer
-    // This matches the position update rate to minimize choppiness
-    this.pollingInterval = window.setInterval(async () => {
-      try {
-        const response = await fetch(`/api/game/state/${this.gameId}`);
-        if (response.ok) {
-          const gameState = await response.json();
-          this.handleGameStateUpdate(gameState);
-        }
-      } catch (error) {
-        console.warn('Polling failed:', error);
-      }
-    }, 100);
-  }
-
-  private stopPolling() {
-    if (this.pollingInterval) {
-      clearInterval(this.pollingInterval);
-      this.pollingInterval = null;
-    }
-  }
-
-  private handleGameStateUpdate(gameState: any) {
-    this.gameState = gameState;
+  private initializeOtherPlayers(gameState: any) {
+    // Initialize other players from game state when joining
+    const beforeCount = this.otherPlayers.size;
+    this.otherPlayers.clear();
     
-    // Only process if game state is valid and game is active
-    if (!gameState || (gameState.status !== 'waiting' && gameState.status !== 'playing')) {
-      console.log('⚠️ Invalid or inactive game state, clearing other players');
-      this.otherPlayers.clear();
+    if (!gameState || !gameState.players) {
+      console.log('⚠️ No game state or players in gameState');
       return;
     }
     
-    // Update other players - only include alive players who are actually in the game
-    this.otherPlayers.clear();
-    if (gameState.players) {
-      const allPlayerIds = Object.keys(gameState.players);
-      console.log('📊 Game state update - all players:', allPlayerIds);
-      console.log('🎯 My player ID:', this.playerId);
-      console.log('🎮 Game status:', gameState.status);
+    console.log('👥 Initializing other players from gameState:', {
+      totalPlayers: Object.keys(gameState.players).length,
+      myPlayerId: this.playerId || '(not set)',
+      allPlayerIds: Object.keys(gameState.players)
+    });
+    
+    // If playerId is not set yet, we can't filter self, so add all players
+    // (This shouldn't happen normally, but handles edge cases)
+    const shouldFilterSelf = !!this.playerId;
+    
+    for (const [playerId, player] of Object.entries(gameState.players)) {
+      const playerData = player as any;
       
-      for (const [playerId, player] of Object.entries(gameState.players)) {
-        const playerData = player as any;
-        
-        // Skip self
-        if (playerId === this.playerId) {
-          console.log(`➖ Skipping self: ${playerId}`);
-          continue;
-        }
-        
-        // Only add alive players with valid position data
-        if (playerData.isAlive !== false && playerData.position) {
-          // Check if player data is recent (not stale)
-          const playerAge = Date.now() - (playerData.lastUpdate || 0);
-          const maxPlayerAge = 10000; // 10 seconds - if no update, consider player disconnected
-          
-          if (playerAge < maxPlayerAge) {
-            console.log(`➕ Adding other player: ${playerId} (age: ${Math.round(playerAge)}ms)`, playerData);
-            this.otherPlayers.set(playerId, playerData);
-          } else {
-            console.log(`⏸️ Skipping stale player: ${playerId} (age: ${Math.round(playerAge)}ms)`);
-          }
-        } else {
-          console.log(`⏭️ Skipping dead/invalid player: ${playerId}`, playerData);
-        }
+      // Skip self if playerId is set
+      if (shouldFilterSelf && playerId === this.playerId) {
+        console.log(`⏭️ Skipping self: ${playerId}`);
+        continue;
       }
       
-      console.log(`👥 Other players count: ${this.otherPlayers.size}`);
-    } else {
-      console.warn('⚠️ No players in game state');
+      // Only add alive players with valid position data
+      if (playerData.isAlive !== false && playerData.position) {
+        console.log(`➕ Adding other player: ${playerId} (${playerData.username || 'unknown'})`);
+        this.otherPlayers.set(playerId, playerData);
+      } else {
+        console.log(`⚠️ Skipping player ${playerId}:`, {
+          isAlive: playerData.isAlive,
+          hasPosition: !!playerData.position,
+          username: playerData.username
+        });
+      }
     }
+    
+    console.log(`📊 Other players: ${beforeCount} → ${this.otherPlayers.size}`);
   }
 
   async updatePlayerPosition(position: { x: number; y: number }, direction: number, isInOwnTerritory: boolean) {
-    // Throttle position updates to prevent ERR_INSUFFICIENT_RESOURCES
+    // Always update Redis (for polling) - throttle to prevent too many requests
     const now = Date.now();
     if (now - this.lastPositionUpdate < this.positionUpdateRate) {
       return; // Skip this update, too soon since last one
@@ -516,8 +321,13 @@ export class MultiplayerManager {
     
     this.lastPositionUpdate = now;
     
+    // Don't send updates if we don't have a game/player ID
+    if (!this.gameId || !this.playerId) {
+      return;
+    }
+    
     try {
-      await fetch('/api/game/update-player', {
+      const response = await fetch('/api/game/update-player', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -528,8 +338,43 @@ export class MultiplayerManager {
           isInOwnTerritory
         })
       });
+      
+      if (!response.ok) {
+        console.warn(`⚠️ Position update failed: ${response.status} ${response.statusText}`);
+      }
     } catch (error) {
       console.error('Failed to update player position:', error);
+    }
+  }
+
+  async updatePlayerDirection(position: { x: number; y: number }, direction: number, isInOwnTerritory: boolean) {
+    // Send direction change via realtime for instant updates (only on input events)
+    if (!this.gameId || !this.playerId) {
+      return;
+    }
+    
+    try {
+      // First update Redis with latest position/direction
+      await this.updatePlayerPosition(position, direction, isInOwnTerritory);
+      
+      // Then send realtime broadcast for instant direction update
+      const response = await fetch('/api/game/update-direction', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          gameId: this.gameId,
+          playerId: this.playerId,
+          position,
+          direction,
+          isInOwnTerritory
+        })
+      });
+      
+      if (!response.ok) {
+        console.warn(`⚠️ Direction update failed: ${response.status}`);
+      }
+    } catch (error) {
+      console.error('Failed to update player direction:', error);
     }
   }
 
@@ -592,7 +437,16 @@ export class MultiplayerManager {
       const result = await response.json();
       console.log('Successfully left game:', result);
 
-      this.stopPolling();
+      
+      // Disconnect from realtime
+      if (this.realtimeConnection) {
+        try {
+          await this.realtimeConnection.disconnect();
+        } catch (error) {
+          console.error('Error disconnecting realtime:', error);
+        }
+        this.realtimeConnection = null;
+      }
       
       // Clear local state
       this.gameId = '';
@@ -601,13 +455,23 @@ export class MultiplayerManager {
       this.otherPlayers.clear();
     } catch (error) {
       console.error('Failed to leave game:', error);
-      // Still stop polling even if leave request failed
-      this.stopPolling();
+      if (this.realtimeConnection) {
+        try {
+          await this.realtimeConnection.disconnect();
+        } catch (error) {
+          console.error('Error disconnecting realtime:', error);
+        }
+        this.realtimeConnection = null;
+      }
     }
   }
 
   getOtherPlayers(): Map<string, any> {
     return this.otherPlayers;
+  }
+
+  onTerritoryClaim(listener: (payload: any) => void) {
+    this.territoryClaimListeners.push(listener);
   }
 
   getGameState(): any {
@@ -623,6 +487,7 @@ export class MultiplayerManager {
   }
 
   isConnected(): boolean {
-    return this.gameId !== '' && this.playerId !== '';
+    return this.realtimeConnection !== null && this.gameId !== '' && this.playerId !== '';
   }
+
 }

@@ -12,9 +12,8 @@ export const createPost = async () => {
       appDisplayName: 'subsurfempire',
       backgroundUri: 'default-splash.png',
       buttonLabel: 'Start Playing',
-      description: 'An exciting interactive experience',
-      entryUri: 'index.html',
-      heading: 'Welcome to the Game!',
+      description: 'An asynchronous multiplayer game where you can claim territory and earn points by drawing closed areas.',
+      heading: 'Welcome to the Subsurf Empire!',
       appIconUri: 'default-icon.png',
     },
     postData: {

@@ -1,24 +1,145 @@
 import { Scene } from 'phaser';
+import * as Phaser from 'phaser';
 
 export class Preloader extends Scene {
+  trailGraphics: Phaser.GameObjects.Graphics;
+  trailHead: Phaser.GameObjects.Graphics;
+  trailPoints: Array<{x: number, y: number}>;
+  animationStartTime: number;
+  animationDuration: number = 3000; // Minimum 1.5 seconds
+  
   constructor() {
     super('Preloader');
   }
 
   init() {
-    //  We loaded this image in our Boot Scene, so we can display it here
-    this.add.image(512, 384, 'background');
-
-    //  A simple progress bar. This is the outline of the bar.
-    this.add.rectangle(512, 384, 468, 32).setStrokeStyle(1, 0xffffff);
-
-    //  This is the progress bar itself. It will increase in size from the left based on the % of progress.
-    const bar = this.add.rectangle(512 - 230, 384, 4, 28, 0xffffff);
-
-    //  Use the 'progress' event emitted by the LoaderPlugin to update the loading bar
-    this.load.on('progress', (progress: number) => {
-      //  Update the progress bar (our bar is 464px wide, so 100% = 464px)
-      bar.width = 4 + 460 * progress;
+    // Set black background
+    this.cameras.main.setBackgroundColor(0x000000);
+    
+    // Initialize graphics for trail animation
+    this.trailGraphics = this.add.graphics();
+    this.trailHead = this.add.graphics();
+    this.trailPoints = [];
+    this.animationStartTime = this.time.now;
+    
+    // Start the trail animation
+    this.animateTrail();
+  }
+  
+  animateTrail() {
+    const redditOrange = 0xff4500;
+    const width = this.scale.width;
+    const height = this.scale.height;
+    
+    // Zig-zag path configuration
+    const startX = -150;
+    const endX = width + 20;
+    const centerY = height / 2;
+    const zigZagHeight = 80;
+    const zigZags = 2;
+    
+    // Event listener for smooth animation
+    const timer = this.time.addEvent({
+      delay: 16, // ~60fps
+      callback: () => {
+        const elapsed = this.time.now - this.animationStartTime;
+        const progress = Math.min(elapsed / this.animationDuration, 1);
+        
+        // Clear previous frame
+        this.trailGraphics.clear();
+        this.trailHead.clear();
+        
+        // Calculate current position along zig-zag path
+        const currentX = startX + (endX - startX) * progress;
+        
+        // Create zig-zag pattern
+        let zigZagProgress = progress * zigZags;
+        const zigZagCycle = zigZagProgress - Math.floor(zigZagProgress);
+        const zigZagIndex = Math.floor(zigZagProgress);
+        
+        // Apply vertical offset based on zig-zag pattern
+        let verticalOffset = 0;
+        if (zigZagIndex % 2 === 0) {
+          // Going up
+          verticalOffset = Math.sin(zigZagCycle * Math.PI) * zigZagHeight;
+        } else {
+          // Going down
+          verticalOffset = Math.sin(zigZagCycle * Math.PI) * -zigZagHeight;
+        }
+        
+        const currentY = centerY + verticalOffset;
+        
+        // Add point to trail
+        this.trailPoints.push({ x: currentX, y: currentY });
+        
+        // Limit trail length to keep it smooth - increased for longer trail
+        const maxTrailLength = 150;
+        if (this.trailPoints.length > maxTrailLength) {
+          this.trailPoints.shift();
+        }
+        
+        // Draw trail with neon glow effect (similar to game)
+        if (this.trailPoints.length > 1 && this.trailPoints[0]) {
+          // Draw multiple glow layers for bloom effect
+          const glowLayers = [
+            { width: 16, alpha: 0.15 },
+            { width: 12, alpha: 0.20 },
+            { width: 8, alpha: 0.25 },
+            { width: 6, alpha: 0.30 }
+          ];
+          
+          // Outer glow layers
+          for (const layer of glowLayers) {
+            this.trailGraphics.lineStyle(layer.width, redditOrange, layer.alpha);
+            this.trailGraphics.beginPath();
+            this.trailGraphics.moveTo(this.trailPoints[0]!.x, this.trailPoints[0]!.y);
+            for (let i = 1; i < this.trailPoints.length; i++) {
+              const point = this.trailPoints[i];
+              if (point) {
+                this.trailGraphics.lineTo(point.x, point.y);
+              }
+            }
+            this.trailGraphics.strokePath();
+          }
+          
+          // Main trail line
+          this.trailGraphics.lineStyle(4, redditOrange, 0.9);
+          this.trailGraphics.beginPath();
+          this.trailGraphics.moveTo(this.trailPoints[0]!.x, this.trailPoints[0]!.y);
+          for (let i = 1; i < this.trailPoints.length; i++) {
+            const point = this.trailPoints[i];
+            if (point) {
+              this.trailGraphics.lineTo(point.x, point.y);
+            }
+          }
+          this.trailGraphics.strokePath();
+        }
+        
+        // Draw trail head (circle like player in game)
+        // Draw glow layers for the head
+        const headGlowLayers = [
+          { radius: 20, alpha: 0.15 },
+          { radius: 16, alpha: 0.20 },
+          { radius: 12, alpha: 0.25 },
+          { radius: 10, alpha: 0.30 }
+        ];
+        
+        // Outer glow layers
+        for (const layer of headGlowLayers) {
+          this.trailHead.fillStyle(redditOrange, layer.alpha);
+          this.trailHead.fillCircle(currentX, currentY, layer.radius);
+        }
+        
+        // Main circle
+        this.trailHead.fillStyle(redditOrange, 1.0);
+        this.trailHead.fillCircle(currentX, currentY, 8);
+        
+        // Stop animation when complete
+        if (progress >= 1) {
+          timer.remove(false);
+        }
+      },
+      repeat: -1 // Repeat until manually stopped
     });
   }
 

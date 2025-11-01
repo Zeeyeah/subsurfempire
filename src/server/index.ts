@@ -1,6 +1,6 @@
 import express from 'express';
 import { InitResponse, IncrementResponse, DecrementResponse } from '../shared/types/api';
-import { redis, createServer, context, reddit } from '@devvit/web/server';
+import { redis, createServer, context, reddit, realtime } from '@devvit/web/server';
 import { createPost } from './core/post';
 
 const app = express();
@@ -377,8 +377,14 @@ async function checkAndCleanupStaleGames(): Promise<void> {
     const gameAge = now - currentGame.createdAt;
     const maxGameAge = 30 * 60 * 1000; // 30 minutes
     
-    // Check if game is stale (very old or no players)
-    const isStale = gameAge > maxGameAge || currentGame.players.size === 0;
+    // Check if game is stale (very old OR no players AND old enough that it's not actively being joined)
+    // Don't clean up games that were just created (less than 5 seconds old) even if empty
+    const isEmpty = currentGame.players.size === 0;
+    const isOld = gameAge > maxGameAge;
+    const isVeryRecentButEmpty = isEmpty && gameAge < 5000; // Less than 5 seconds old
+    
+    // Only clean up if: (very old) OR (empty AND not very recently created)
+    const isStale = isOld || (isEmpty && !isVeryRecentButEmpty);
     
     if (isStale) {
       console.log(`🧹 Cleaning up stale game: age=${Math.round(gameAge / 1000)}s, players=${currentGame.players.size}`);
@@ -440,9 +446,9 @@ router.post('/api/game/create', async (_req, res): Promise<void> => {
 // Simple join - join the current game if available
 router.post('/api/game/join', async (req, res): Promise<void> => {
   try {
-    const { username, subreddit } = req.body;
+    const { username, subreddit, position, direction } = req.body;
     
-    console.log('Join request received:', { username, subreddit, body: req.body });
+    console.log('🔵 Join request received:', { username, subreddit, hasPosition: !!position, hasDirection: direction !== undefined });
     
     if (!username || typeof username !== 'string' || username.trim() === '') {
       console.error('Invalid username provided:', username);
@@ -450,10 +456,21 @@ router.post('/api/game/join', async (req, res): Promise<void> => {
       return;
     }
     
-    // Check for stale games first
+    // Check for stale games first (only really old games, not empty waiting games)
     await checkAndCleanupStaleGames();
     
+    // Get current game (with retry logic for race conditions)
     let currentGame = await getCurrentGame();
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    // Retry logic to handle race conditions when two players join simultaneously
+    while (!currentGame && attempts < maxAttempts) {
+      console.log(`🔄 No game found, attempt ${attempts + 1}/${maxAttempts}`);
+      await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
+      currentGame = await getCurrentGame();
+      attempts++;
+    }
     
     if (!currentGame) {
       // Create new game if none exists
@@ -464,50 +481,120 @@ router.post('/api/game/join', async (req, res): Promise<void> => {
         status: 'waiting',
         createdAt: Date.now()
       };
+      console.log(`🆕 Created new game: ${gameId}`);
+      await setCurrentGame(currentGame);
+    } else {
+      console.log(`✅ Found existing game: ${currentGame.gameId} with ${currentGame.players.size} player(s)`);
+    }
+    
+    // Re-check game state after delay (in case another player joined)
+    currentGame = await getCurrentGame();
+    if (!currentGame) {
+      // Game was deleted between checks, create new one
+      const gameId = `simple_game_${Date.now()}`;
+      currentGame = {
+        gameId,
+        players: new Map(),
+        status: 'waiting',
+        createdAt: Date.now()
+      };
+      await setCurrentGame(currentGame);
+      console.log(`🆕 Recreated game after deletion: ${gameId}`);
     }
     
     if (currentGame.players.size >= 2) {
+      console.log(`❌ Game ${currentGame.gameId} is full (${currentGame.players.size}/2)`);
       res.status(400).json({ error: 'Game is full (max 2 players)' });
       return;
     }
     
     const playerId = `player_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    console.log(`👤 Adding player ${playerId} to game ${currentGame.gameId}`);
     
-    // Randomize spawn positions but keep players close to each other
+    // Use client-provided position/direction if available, otherwise generate spawn position
     const gameCenterX = 400;
     const gameCenterY = 300;
     const spawnRadius = 80; // Distance from center for random spawn
     
     let spawnX: number;
     let spawnY: number;
+    let spawnDirection: number;
     
-    if (currentGame.players.size === 0) {
-      // First player - spawn at center or slightly offset
-      const angle = Math.random() * Math.PI * 2;
-      const offset = 20 + Math.random() * 30; // 20-50 pixels from center
-      spawnX = gameCenterX + Math.cos(angle) * offset;
-      spawnY = gameCenterY + Math.sin(angle) * offset;
+    if (position && typeof position.x === 'number' && typeof position.y === 'number') {
+      // Use client-provided position
+      spawnX = position.x;
+      spawnY = position.y;
+      console.log(`📍 Using client-provided position: (${spawnX}, ${spawnY})`);
     } else {
-      // Second player - spawn near first player but not too close
-      const firstPlayer = Array.from(currentGame.players.values())[0];
-      const firstPlayerPos = firstPlayer.position;
-      
-      // Spawn 60-120 pixels away from first player
-      const distance = 60 + Math.random() * 60;
-      const angle = Math.random() * Math.PI * 2;
-      spawnX = firstPlayerPos.x + Math.cos(angle) * distance;
-      spawnY = firstPlayerPos.y + Math.sin(angle) * distance;
-      
-      // Ensure second player stays within spawn radius from center
-      const distanceFromCenter = Math.sqrt(
-        Math.pow(spawnX - gameCenterX, 2) + Math.pow(spawnY - gameCenterY, 2)
-      );
-      if (distanceFromCenter > spawnRadius) {
-        // Clamp to spawn radius
-        const angleToCenter = Math.atan2(gameCenterY - spawnY, gameCenterX - spawnX);
-        spawnX = gameCenterX + Math.cos(angleToCenter) * spawnRadius;
-        spawnY = gameCenterY + Math.sin(angleToCenter) * spawnRadius;
+      // Generate spawn position (fallback if client didn't provide one)
+      if (currentGame.players.size === 0) {
+        // First player - spawn at center or slightly offset
+        const angle = Math.random() * Math.PI * 2;
+        const offset = 20 + Math.random() * 30; // 20-50 pixels from center
+        spawnX = gameCenterX + Math.cos(angle) * offset;
+        spawnY = gameCenterY + Math.sin(angle) * offset;
+      } else {
+        // Second player - spawn near first player but not too close
+        const firstPlayer = Array.from(currentGame.players.values())[0];
+        const firstPlayerPos = firstPlayer.position;
+        
+        // Spawn 60-120 pixels away from first player
+        const distance = 60 + Math.random() * 60;
+        const angle = Math.random() * Math.PI * 2;
+        spawnX = firstPlayerPos.x + Math.cos(angle) * distance;
+        spawnY = firstPlayerPos.y + Math.sin(angle) * distance;
+        
+        // Ensure second player stays within spawn radius from center
+        const distanceFromCenter = Math.sqrt(
+          Math.pow(spawnX - gameCenterX, 2) + Math.pow(spawnY - gameCenterY, 2)
+        );
+        if (distanceFromCenter > spawnRadius) {
+          // Clamp to spawn radius
+          const angleToCenter = Math.atan2(gameCenterY - spawnY, gameCenterX - spawnX);
+          spawnX = gameCenterX + Math.cos(angleToCenter) * spawnRadius;
+          spawnY = gameCenterY + Math.sin(angleToCenter) * spawnRadius;
+        }
       }
+    }
+    
+    // Use client-provided direction if available, otherwise random
+    if (direction !== undefined && typeof direction === 'number') {
+      spawnDirection = direction;
+      console.log(`🧭 Using client-provided direction: ${spawnDirection}`);
+    } else {
+      spawnDirection = Math.random() * Math.PI * 2;
+      console.log(`🎲 Generated random direction: ${spawnDirection}`);
+    }
+    
+    // Final check - get the absolute latest game state right before adding player
+    // This prevents race conditions where another player joined while we were calculating spawn position
+    const latestGame = await getCurrentGame();
+    if (!latestGame || latestGame.gameId !== currentGame.gameId) {
+      // Game changed or was deleted, use latest or recreate
+      if (latestGame) {
+        currentGame = latestGame;
+        console.log(`🔄 Game state updated, now has ${currentGame.players.size} player(s)`);
+      } else {
+        // Game was deleted, create new one
+        const gameId = `simple_game_${Date.now()}`;
+        currentGame = {
+          gameId,
+          players: new Map(),
+          status: 'waiting',
+          createdAt: Date.now()
+        };
+        await setCurrentGame(currentGame);
+        console.log(`🆕 Game was deleted during join, created new: ${gameId}`);
+      }
+    } else {
+      currentGame = latestGame; // Use latest state
+    }
+    
+    // Double-check capacity after getting latest state
+    if (currentGame.players.size >= 2) {
+      console.log(`❌ Game ${currentGame.gameId} became full during join (${currentGame.players.size}/2)`);
+      res.status(400).json({ error: 'Game is full (max 2 players)' });
+      return;
     }
     
     const player = {
@@ -515,7 +602,7 @@ router.post('/api/game/join', async (req, res): Promise<void> => {
       username,
       subreddit: subreddit || 'r/gaming',
       position: { x: spawnX, y: spawnY },
-      direction: Math.random() * Math.PI * 2,
+      direction: spawnDirection,
       color: currentGame.players.size === 0 ? 0xff4500 : 0x00ff00, // Red for first player, green for second
       isAlive: true,
       trailPoints: [],
@@ -529,9 +616,27 @@ router.post('/api/game/join', async (req, res): Promise<void> => {
     // Start game if we have 2 players
     if (currentGame.players.size === 2) {
       currentGame.status = 'playing';
+      console.log(`🎮 Game ${currentGame.gameId} started with 2 players!`);
     }
     
     await setCurrentGame(currentGame);
+    console.log(`💾 Saved game ${currentGame.gameId} with ${currentGame.players.size} player(s)`);
+    
+    // Broadcast initial game state via realtime when player joins
+    try {
+      await realtime.send('game', {
+        type: 'gameStateUpdate',
+        gameState: {
+          gameId: currentGame.gameId,
+          players: Object.fromEntries(currentGame.players),
+          status: currentGame.status,
+          maxPlayers: 2,
+          createdAt: currentGame.createdAt
+        }
+      });
+    } catch (realtimeError) {
+      console.warn('Realtime send failed for game state update:', realtimeError);
+    }
     
     res.json({ 
       playerId, 
@@ -550,6 +655,7 @@ router.post('/api/game/join', async (req, res): Promise<void> => {
 });
 
 // Simple position update
+// NOTE: Position updates only update Redis, no realtime broadcast (polling handles state sync)
 router.post('/api/game/update-player', async (req, res): Promise<void> => {
   try {
     const { gameId, playerId, position, direction, isInOwnTerritory } = req.body;
@@ -574,10 +680,64 @@ router.post('/api/game/update-player', async (req, res): Promise<void> => {
     
     await setCurrentGame(currentGame);
     
+    // NO realtime broadcast for position updates - polling will handle this
+    // This prevents deadline exceeded errors since position updates are frequent
+    // Polling at 200ms interval is sufficient for smooth gameplay
+    // Only use realtime for critical events (joins, leaves, deaths)
+    
     res.json({ success: true });
   } catch (error) {
     console.error('Failed to update player:', error);
     res.status(500).json({ error: 'Failed to update player' });
+  }
+});
+
+// Direction update - broadcasts via realtime for instant input response
+router.post('/api/game/update-direction', async (req, res): Promise<void> => {
+  try {
+    const { gameId, playerId, position, direction, isInOwnTerritory } = req.body;
+    
+    const currentGame = await getCurrentGame();
+    
+    if (!currentGame || currentGame.gameId !== gameId) {
+      res.status(404).json({ error: 'Game not found' });
+      return;
+    }
+    
+    const player = currentGame.players.get(playerId);
+    if (!player) {
+      res.status(404).json({ error: 'Player not found' });
+      return;
+    }
+    
+    // Update player state
+    player.position = position;
+    player.direction = direction;
+    player.isInOwnTerritory = isInOwnTerritory;
+    player.lastUpdate = Date.now();
+    
+    await setCurrentGame(currentGame);
+    
+    // Broadcast direction change via realtime (this is infrequent, only on input events)
+    try {
+      await realtime.send('game', {
+        type: 'playerUpdate',
+        playerUpdate: {
+          playerId,
+          position,
+          direction,
+          isInOwnTerritory,
+          timestamp: Date.now()
+        }
+      });
+    } catch (realtimeError) {
+      // Silent fail - polling will pick up the update anyway
+    }
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Failed to update direction:', error);
+    res.status(500).json({ error: 'Failed to update direction' });
   }
 });
 
@@ -603,6 +763,9 @@ router.post('/api/game/update-trail', async (req, res): Promise<void> => {
     player.lastUpdate = Date.now();
     
     await setCurrentGame(currentGame);
+    
+    // NO realtime broadcast for trail updates - polling will handle this
+    // Trail updates are frequent and would cause deadline exceeded errors
     
     res.json({ success: true });
   } catch (error) {
@@ -634,6 +797,21 @@ router.post('/api/game/claim-territory', async (req, res): Promise<void> => {
     player.lastUpdate = Date.now();
     
     await setCurrentGame(currentGame);
+    
+    // Territory claims can use realtime (they're infrequent), but polling will also pick it up
+    // Only broadcast if not throttled to prevent deadline errors
+    try {
+      await realtime.send('game', {
+        type: 'territoryClaim',
+        territoryClaim: {
+          playerId,
+          occupiedArea,
+          timestamp: Date.now()
+        }
+      });
+    } catch (realtimeError) {
+      // Silent fail - polling will pick up the territory claim anyway
+    }
     
     res.json({ success: true });
   } catch (error) {
@@ -667,7 +845,7 @@ router.get('/api/game/state/:gameId', async (req, res): Promise<void> => {
   }
 });
 
-// Simple leave game
+// Simple leave game - removes player completely (trails, occupied areas, all data)
 router.post('/api/game/leave', async (req, res): Promise<void> => {
   try {
     const { gameId, playerId } = req.body;
@@ -679,23 +857,58 @@ router.post('/api/game/leave', async (req, res): Promise<void> => {
       return;
     }
     
-    currentGame.players.delete(playerId);
+    // Check if player exists before removing
+    const playerExists = currentGame.players.has(playerId);
+    
+    if (playerExists) {
+      // Remove player completely - this removes all their data (trails, occupied areas, etc.)
+      currentGame.players.delete(playerId);
+      console.log('🗑️ Removed player from game:', { gameId, playerId, playersLeft: currentGame.players.size });
+    } else {
+      console.log('⚠️ Player not found in game (may have already been removed):', { gameId, playerId });
+    }
 
-    console.log('Player left game:', { gameId, playerId, playersLeft: currentGame.players.size });
     // Reset game if no players left
     if (currentGame.players.size === 0) {
       console.log('🧹 Game is empty, cleaning up automatically...');
       await setCurrentGame(null);
-      await redis.del('*')
-
       console.log('✅ Empty game cleaned up automatically');
     } else {
-      // Reset to waiting if only one player left
+      // Reset to waiting if only one player left (game can't continue with 1 player)
       currentGame.status = 'waiting';
       await setCurrentGame(currentGame);
+      
+      // Broadcast updated game state so other players know the player count decreased
+      try {
+        await realtime.send('game', {
+          type: 'gameStateUpdate',
+          gameState: {
+            gameId: currentGame.gameId,
+            players: Object.fromEntries(currentGame.players),
+            status: currentGame.status,
+            maxPlayers: 2,
+            createdAt: currentGame.createdAt
+          }
+        });
+        
+        // Also broadcast player removal event
+        await realtime.send('game', {
+          type: 'playerRemoved',
+          playerId: playerId,
+          gameId: gameId
+        });
+        
+        console.log('📤 Broadcasted player removal and updated game state');
+      } catch (realtimeError) {
+        console.warn('⚠️ Failed to broadcast player removal:', realtimeError);
+      }
     }
     
-    res.json({ success: true });
+    res.json({ 
+      success: true,
+      playersRemaining: currentGame.players.size,
+      gameStatus: currentGame.players.size === 0 ? 'ended' : currentGame.status
+    });
   } catch (error) {
     console.error('Failed to leave game:', error);
     res.status(500).json({ error: 'Failed to leave game' });
